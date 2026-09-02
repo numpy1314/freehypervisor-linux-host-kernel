@@ -1,0 +1,199 @@
+// Copyright 2025 The Axvisor Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use ax_kspin::SpinNoIrq;
+use ax_lazyinit::LazyInit;
+use ax_timer_list::{TimeValue, TimerEvent, TimerList};
+
+static TOKEN: AtomicUsize = AtomicUsize::new(0);
+static TIMER_REGISTER_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TIMER_EXPIRE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TIMER_REARM_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+// const PERIODIC_INTERVAL_NANOS: u64 =
+//     axvisor_api::time::NANOS_PER_SEC / ax_config::TICKS_PER_SEC as u64;
+
+/// Represents a timer event in the virtual machine monitor (VMM).
+///
+/// This struct holds a unique token for the timer and a callback function
+/// that will be executed when the timer expires.
+pub struct VmmTimerEvent {
+    // Unique identifier for the timer event
+    token: usize,
+    // Callback function to be executed when the timer expires
+    timer_callback: Box<dyn FnOnce(TimeValue) + Send + 'static>,
+}
+
+impl VmmTimerEvent {
+    fn new<F>(token: usize, f: F) -> Self
+    where
+        F: FnOnce(TimeValue) + Send + 'static,
+    {
+        Self {
+            token,
+            timer_callback: Box::new(f),
+        }
+    }
+}
+
+impl TimerEvent for VmmTimerEvent {
+    fn callback(self, now: TimeValue) {
+        (self.timer_callback)(now)
+    }
+}
+
+#[ax_percpu::def_percpu]
+static TIMER_LIST: LazyInit<SpinNoIrq<TimerList<VmmTimerEvent>>> = LazyInit::new();
+
+/// Registers a new timer that will execute at the specified deadline
+///
+/// # Arguments
+/// - `deadline`: The absolute monotonic time in nanoseconds when the timer should trigger
+/// - `handler`: The callback function to execute when the timer expires
+///
+/// # Returns
+/// A unique token that can be used to cancel this timer later
+pub fn register_timer<F>(deadline: u64, handler: F) -> usize
+where
+    F: FnOnce(TimeValue) + Send + 'static,
+{
+    trace!("Registering timer...");
+    trace!(
+        "deadline is {:#?} = {:#?}",
+        deadline,
+        TimeValue::from_nanos(deadline)
+    );
+    // SAFETY: Called from a vCPU task pinned to a physical CPU. TIMER_LIST is
+    // initialised per-CPU in init_percpu() before any timer operation is invoked.
+    // The token is only an identifier used for cancellation and does not
+    // publish any timer data, so relaxed ordering is sufficient.
+    let token = TOKEN.fetch_add(1, Ordering::Relaxed);
+    let next_deadline = {
+        let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+        let mut timers = timer_list.lock();
+        let event = VmmTimerEvent::new(token, handler);
+        timers.set(TimeValue::from_nanos(deadline), event);
+        timers.next_deadline()
+    };
+    let count = TIMER_REGISTER_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 16 || count.is_power_of_two() {
+        info!(
+            "vmm::timer register token={} deadline_ns={} next_deadline_ns={:?} count={}",
+            token,
+            deadline,
+            next_deadline.map(|deadline| deadline.as_nanos()),
+            count
+        );
+    }
+    rearm_host_timer(next_deadline);
+    token
+}
+
+/// Cancels a timer with the specified token.
+///
+/// # Parameters
+/// - `token`: The unique token of the timer to cancel.
+pub fn cancel_timer(token: usize) {
+    // SAFETY: Called from a vCPU task pinned to a physical CPU. TIMER_LIST is
+    // initialised per-CPU in init_percpu() before any timer operation is invoked.
+    let next_deadline = {
+        let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+        let mut timers = timer_list.lock();
+        timers.cancel(|event| event.token == token);
+        timers.next_deadline()
+    };
+    rearm_host_timer(next_deadline);
+}
+
+/// Check and process any pending timer events
+pub fn check_events() {
+    // SAFETY: Called from a vCPU task pinned to a physical CPU. TIMER_LIST is
+    // initialised per-CPU in init_percpu() before any timer operation is invoked.
+    let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+    loop {
+        let now = axvisor_api::time::current_time();
+        let event = timer_list.lock().expire_one(now);
+        if let Some((_deadline, event)) = event {
+            let count = TIMER_EXPIRE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 32 || count.is_power_of_two() {
+                info!(
+                    "vmm::timer expire token={} deadline_ns={} now_ns={} count={}",
+                    event.token,
+                    _deadline.as_nanos(),
+                    now.as_nanos(),
+                    count
+                );
+            }
+            trace!("pick one {_deadline:#?} to handle!!!");
+            event.callback(now);
+        } else {
+            let next_deadline = timer_list.lock().next_deadline();
+            rearm_host_timer(next_deadline);
+            break;
+        }
+    }
+
+    // On the Linux x86_64 host the VMX preemption timer is unavailable under
+    // nested virtualization, so an idle guest blocks in the vCPU wait queue
+    // (see vcpus.rs Halt handling) and relies on the host hrtimer to wake it.
+    // This function runs on the hrtimer callback path, so wake the idle vCPUs
+    // here: the woken vCPU re-checks its PIT/serial sources and re-arms the
+    // next host timer, restoring the periodic tick even without a software
+    // timer-list entry.
+    #[cfg(target_arch = "x86_64")]
+    super::vcpus::notify_all_registered_vcpus();
+}
+
+fn rearm_host_timer(next_deadline: Option<TimeValue>) {
+    if let Some(deadline) = next_deadline {
+        let count = TIMER_REARM_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 16 || count.is_power_of_two() {
+            info!(
+                "vmm::timer rearm_host_timer deadline_ns={} count={}",
+                deadline.as_nanos(),
+                count
+            );
+        }
+        axvisor_api::time::set_oneshot_timer(deadline);
+    }
+}
+
+// /// Schedule the next timer event based on the periodic interval
+// pub fn scheduler_next_event() {
+//     trace!("Scheduling next event...");
+//     let now_ns = axvisor_api::time::current_time_nanos();
+//     let deadline = now_ns + PERIODIC_INTERVAL_NANOS;
+//     debug!("PHY deadline {} !!!", deadline);
+//     axvisor_api::time::set_oneshot_timer(TimeValue::from_nanos(deadline));
+// }
+
+/// Initialize the hypervisor timer system
+pub fn init_percpu() {
+    info!("Initing HV Timer...");
+    // SAFETY: Called once per CPU during hypervisor initialisation, before
+    // any timer operation is invoked on that CPU. Linux-host mode can call
+    // this more than once on the same host CPU during boot and vCPU task
+    // entry, so initialization must be idempotent for the current percpu slot.
+    let timer_list = unsafe { TIMER_LIST.current_ref_mut_raw() };
+    if timer_list
+        .call_once(|| SpinNoIrq::new(TimerList::new()))
+        .is_some()
+    {
+        info!("HV Timer initialized for current CPU");
+    } else {
+        info!("HV Timer already initialized for current CPU");
+    }
+}

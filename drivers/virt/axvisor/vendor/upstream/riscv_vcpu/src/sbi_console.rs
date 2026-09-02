@@ -1,0 +1,105 @@
+// Copyright 2025 The Axvisor Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use sbi_spec::binary::SbiRet;
+
+#[cfg(axvisor_host_riscv64)]
+unsafe extern "C" {
+    fn axvisor_adapter_guest_console_write_byte(byte: usize);
+    fn axvisor_adapter_guest_console_read_byte() -> isize;
+}
+
+pub const EID_DBCN: usize = 0x4442434e;
+pub const FID_CONSOLE_WRITE: usize = 0;
+pub const FID_CONSOLE_READ: usize = 1;
+pub const FID_CONSOLE_WRITE_BYTE: usize = 2;
+
+/// SBI success state return value.
+pub const RET_SUCCESS: usize = 0;
+/// Error for SBI call failed for unknown reasons.
+pub const RET_ERR_FAILED: usize = -1isize as _;
+/// Error for target operation not supported.
+pub const RET_ERR_NOT_SUPPORTED: usize = -2isize as _;
+/// Error for invalid SBI parameters.
+pub const RET_ERR_INVALID_PARAM: usize = -3isize as _;
+
+/// Writes bytes to the console using SBI byte-wise API.
+#[cfg(not(axvisor_host_riscv64))]
+pub fn console_write(buf: &[u8]) -> SbiRet {
+    axvisor_api::console::write_bytes(buf);
+    SbiRet::success(buf.len())
+}
+
+/// Reads bytes from the console into a buffer using SBI byte-wise API.
+#[cfg(not(axvisor_host_riscv64))]
+pub fn console_read(buf: &mut [u8]) -> SbiRet {
+    let count = axvisor_api::console::read_bytes(buf);
+    SbiRet::success(count)
+}
+
+/// Writes bytes to the Linux-host guest console.
+#[cfg(axvisor_host_riscv64)]
+pub fn console_write(buf: &[u8]) -> SbiRet {
+    for &byte in buf {
+        unsafe { axvisor_adapter_guest_console_write_byte(byte as usize) };
+    }
+    SbiRet::success(buf.len())
+}
+
+/// Reads bytes from the Linux-host guest console. SBI DBCN reads are non-blocking.
+#[cfg(axvisor_host_riscv64)]
+pub fn console_read(buf: &mut [u8]) -> SbiRet {
+    let mut count = 0;
+    for byte in buf {
+        let value = unsafe { axvisor_adapter_guest_console_read_byte() };
+        if value < 0 {
+            break;
+        }
+        *byte = value as u8;
+        count += 1;
+    }
+    SbiRet::success(count)
+}
+
+/// Writes a full string to console using SBI byte-wise API (no log prefix).
+#[inline(always)]
+#[allow(dead_code)]
+pub fn print_str(s: &str) {
+    console_write(s.as_bytes());
+}
+
+/// Writes a full string + newline to console (no log prefix).
+#[inline(always)]
+#[allow(dead_code)]
+pub fn println_str(s: &str) {
+    print_str(s);
+    axvisor_api::console::write_bytes(b"\n");
+}
+
+/// Writes a byte to the console.
+#[inline(always)]
+pub fn print_byte(byte: u8) {
+    #[cfg(not(axvisor_host_riscv64))]
+    axvisor_api::console::write_bytes(&[byte]);
+    #[cfg(axvisor_host_riscv64)]
+    unsafe {
+        axvisor_adapter_guest_console_write_byte(byte as usize);
+    }
+}
+
+/// Joins two `usize` values into a `u64` value representing a guest physical address (GPA).
+#[inline(always)]
+pub fn join_u64(base_lo: usize, base_hi: usize) -> u64 {
+    ((base_hi as u64) << 32) | (base_lo as u64)
+}

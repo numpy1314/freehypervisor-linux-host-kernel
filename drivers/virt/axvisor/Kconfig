@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config AXVISOR_ADAPTER
+	tristate "AxVisor Linux host adapter (Rust)"
+	depends on RUST
+	depends on VIRT_DRIVERS
+	help
+	  This option builds a Rust-based Linux host adapter for AxVisor.
+	  The first version focuses on the host runtime adapter layer and
+	  starts with the task-spawn runtime glue required by AxVisor.
+
+config AXVISOR_KVM
+	tristate "AxVisor KVM ABI provider"
+	depends on VIRT_DRIVERS
+	depends on MMU
+	help
+	  This option builds an AxVisor-backed /dev/kvm compatibility provider.
+	  It is separate from AXVISOR_ADAPTER: AXVISOR_ADAPTER runs AxVisor as a
+	  Linux-hosted hypervisor, while AXVISOR_KVM exposes the Linux KVM UAPI to
+	  userspace VMMs such as Firecracker.
+
+	  The provider registers /dev/kvm. Do not load it together with Linux's
+	  native kvm module, because both providers claim the same misc device.
+
+config AXVISOR_KVM_AXVISOR_BACKEND
+	bool "Link AxVisor backend into the KVM ABI provider"
+	depends on AXVISOR_KVM
+	depends on X86_64
+	help
+	  This links the AxVisor backend bridge into axvisor_kvm.ko. The bridge
+	  registers backend operations only when the Rust AxVM backend symbols are
+	  linked into the same module; otherwise /dev/kvm keeps the deterministic
+	  fail-entry provider behavior.
+
+choice
+	prompt "AxVisor KVM Rust backend implementation"
+	depends on AXVISOR_KVM_AXVISOR_BACKEND
+	depends on RUST
+
+config AXVISOR_KVM_RUST_BACKEND
+	bool "Build Rust scaffold backend symbols for the KVM ABI provider"
+	help
+	  This builds the Rust-side axvisor_kvm_rs_* backend symbols into
+	  axvisor_kvm.ko. The current implementation is a linkable handle and
+	  state-lifetime scaffold. It does not run AxVM yet: real AxVM-backed
+	  VM/vCPU execution must be provided by the x86_64 no_std bridge and
+	  linked with axvm/x86_vcpu built with vmx or svm enabled.
+
+config AXVISOR_KVM_X86_BRIDGE
+	bool "Build no_std x86 AxVisor bridge for the KVM ABI provider"
+	depends on X86_64
+	help
+	  This builds a no_std x86 bridge and partially links only the required
+	  AxVisor Rust archive members into axvisor_kvm.ko. The bridge exports the
+	  same axvisor_kvm_rs_* symbols as the Rust scaffold, but it uses the
+	  AxVisor no_std runtime build model so axvm/x86_vcpu can be linked in with
+	  vmx or svm enabled.
+
+endchoice
